@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Resources for automatic stop and start of instances during non working hours.
+
+Resources:
+  # 1. SNS Topic for RDS Notifications
+  ScheduledRestartTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ScheduledRestartTopic
+
+  # 2. RDS Event Subscription
+  DevRDSEventSubscription:
+    Type: AWS::RDS::EventSubscription
+    Properties:
+      SnsTopicArn: !Ref ScheduledRestartTopic
+      SourceType: "db-instance"
+      EventCategories:
+        - "availability"
+        - "configuration change"
+        - "notification"
+        - "failure"
+      SourceIds:
+        - "test-db-shawon"
+      Enabled: true
+
+  # 3. IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ScheduledRestartExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScheduledRestartPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+              # Start and Stop RDS instance permissions
+              - Effect: Allow
+                Action:
+                  - rds:StartDBInstance
+                  - rds:StopDBInstance
+                Resource: "arn:aws:rds:eu-central-1:120569640527:db:test-db-shawon"
+
+  # 4. Lambda Function (Inline Python Code)
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ScheduledRestartFunction
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          def lambda_handler(event, context):
+            rds = boto3.client('rds')
+            action = event['action']
+            db_name = event['db_name']
+            if action == 'start':
+                response = rds.start_db_instance(DBInstanceIdentifier=db_name)
+            else:
+                response = rds.stop_db_instance(DBInstanceIdentifier=db_name)
+
+            print(f"{action} RDS Instance {db_name}: {response}")
+            return
+
+  # 5. EventBridge Rule 1 - Start DB at 7:00 AM (Monday to Friday) (Time is always in UTC format)
+  EventBridgeRuleStart:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DevRDSStartRule
+      ScheduleExpression: "cron(0 6 ? * MON-FRI *)"  
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: DevRDSStartAction
+          Input: '{"action": "start", "db_name": "test-db-shawon"}'
+
+  # 6. EventBridge Rule 2 - Stop DB at 9:00 PM (Monday to Friday) (Time is always in UTC format)
+  EventBridgeRuleStop:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DevStopRule
+      ScheduleExpression: "cron(0 20 ? * MON-FRI *)" 
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: DevRDSStopAction
+          Input: '{"action": "stop", "db_name": "test-db-shawon"}'
+          
+
+  # 7. Permissions for EventBridge to invoke Lambda
+  LambdaPermissionForEventBridge:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+
+
